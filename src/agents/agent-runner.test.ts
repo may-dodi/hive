@@ -4977,3 +4977,151 @@ describe("KPR-434: memory rides the turn input under the digest gate; system pro
     expect(mockLog.info).toHaveBeenCalledWith("Sending prompt to agent", expect.objectContaining({ promptLength: 5 }));
   });
 });
+
+describe("KPR-434: tool failures are a recorded outcome, not silence", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessages = null;
+    mockQueryOverride = null;
+  });
+
+  /** tool_use assistant message + the user message carrying its result. */
+  function toolExchange(tool: string, id: string, isError: boolean, content: any) {
+    return [
+      {
+        type: "assistant",
+        message: { id: `m-${id}`, content: [{ type: "tool_use", id, name: tool, input: {} }] },
+        session_id: "s1",
+      },
+      {
+        type: "user",
+        message: { content: [{ type: "tool_result", tool_use_id: id, is_error: isError, content }] },
+        session_id: "s1",
+      },
+    ];
+  }
+
+  const okResult = {
+    type: "result",
+    subtype: "success",
+    result: "response",
+    total_cost_usd: 0.05,
+    duration_ms: 5000,
+    session_id: "s1",
+  };
+
+  // The regression this whole ticket exists for. Before the fix this run was
+  // recorded byte-identically to one that read the inbox: toolCalls 1,
+  // hasError false, producedOutput true, and nothing in the log matching
+  // invalid_grant. Ten days of a dead token scored as healthy.
+  it("an invalid_grant gmail result is counted and greppable in the log", async () => {
+    mockMessages = [
+      ...toolExchange(
+        "mcp__google__gmail_search",
+        "t1",
+        true,
+        'Search failed: oauth2: "invalid_grant" "Token has been expired or revoked."',
+      ),
+      okResult,
+    ];
+
+    const runner = makeRunner();
+    await runner.send("check the inbox");
+
+    const rec = completionRecord()!;
+    expect(rec.toolErrors).toBe(1);
+    expect(rec.toolErrorSummary).toBe("google:1");
+
+    expect(mockLog.warn).toHaveBeenCalledWith(
+      "Tool call failed",
+      expect.objectContaining({
+        tool: "mcp__google__gmail_search",
+        error: expect.stringContaining("invalid_grant"),
+      }),
+    );
+  });
+
+  // The point of the ticket: the failure must not be inferable only from the
+  // absence of something. A health check has to be able to read a number.
+  it("a successful run reports toolErrors:0 rather than omitting the field", async () => {
+    mockMessages = [...toolExchange("mcp__google__gmail_search", "t1", false, "3 threads"), okResult];
+
+    const runner = makeRunner();
+    await runner.send("check the inbox");
+
+    const rec = completionRecord()!;
+    expect(rec.toolErrors).toBe(0);
+    expect(rec).not.toHaveProperty("toolErrorSummary");
+    expect(mockLog.warn).not.toHaveBeenCalledWith("Tool call failed", expect.anything());
+  });
+
+  // hasError means "the run did not complete". Muriel's runs DID complete and
+  // correctly reported the outage; marking them failed would be false in the
+  // other direction and would break agent-roundup's abort accounting.
+  it("a tool failure does not mark the run itself as failed", async () => {
+    mockMessages = [...toolExchange("mcp__google__gmail_search", "t1", true, "boom"), okResult];
+
+    const runner = makeRunner();
+    const result = await runner.send("check the inbox");
+
+    const rec = completionRecord()!;
+    expect(rec.hasError).toBe(false);
+    expect(rec.producedOutput).toBe(true);
+    expect(rec._level).toBe(mockLog.info);
+    expect(result.text).toBe("response");
+  });
+
+  // Generalization: nothing here is Google-specific. The branch reads the
+  // generic tool_result shape, so any credentialed downstream is covered.
+  it("counts failures per server across unrelated tools", async () => {
+    mockMessages = [
+      ...toolExchange("mcp__clickup__clickup_get_task", "t1", true, "401 Unauthorized"),
+      ...toolExchange("mcp__slack__slack_send_message", "t2", true, "channel_not_found"),
+      ...toolExchange("mcp__clickup__clickup_search_tasks", "t3", true, "401 Unauthorized"),
+      ...toolExchange("Bash", "t4", false, "ok"),
+      okResult,
+    ];
+
+    const runner = makeRunner();
+    await runner.send("do work");
+
+    const rec = completionRecord()!;
+    expect(rec.toolErrors).toBe(3);
+    // Sorted by count desc, so the worst-hit server leads.
+    expect(rec.toolErrorSummary).toBe("clickup:2, slack:1");
+  });
+
+  it("normalizes array-shaped content and bounds a runaway error body", async () => {
+    mockMessages = [
+      ...toolExchange("Bash", "t1", true, [{ type: "text", text: "x".repeat(5000) }]),
+      okResult,
+    ];
+
+    const runner = makeRunner();
+    await runner.send("do work");
+
+    const call = mockLog.warn.mock.calls.find((c) => c[0] === "Tool call failed")!;
+    expect((call[1] as any).error).toHaveLength(300);
+    expect(completionRecord()!.toolErrors).toBe(1);
+  });
+
+  it("survives a result whose tool_use was never seen", async () => {
+    mockMessages = [
+      {
+        type: "user",
+        message: { content: [{ type: "tool_result", tool_use_id: "ghost", is_error: true, content: "orphan" }] },
+        session_id: "s1",
+      },
+      okResult,
+    ];
+
+    const runner = makeRunner();
+    await runner.send("do work");
+
+    expect(completionRecord()!.toolErrors).toBe(1);
+    expect(mockLog.warn).toHaveBeenCalledWith(
+      "Tool call failed",
+      expect.objectContaining({ tool: "unknown" }),
+    );
+  });
+});

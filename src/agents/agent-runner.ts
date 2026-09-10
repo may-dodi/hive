@@ -2229,8 +2229,30 @@ export class AgentRunner {
     let preCompactTokens: number | undefined;
 
     // Instrumentation
-    const toolCalls: { tool: string; startMs: number; endMs?: number }[] = [];
+    const toolCalls: { tool: string; startMs: number; endMs?: number; id?: string }[] = [];
     let activeToolName: string | null = null;
+
+    // KPR-434: tool OUTCOMES. Until now the runner recorded that a tool was
+    // INVOKED ("Tool call started") and how the session ended, but never
+    // whether any individual tool actually worked — the SDK delivers that in
+    // `user`-type messages carrying tool_result blocks, and this loop had no
+    // branch for them at all. The string "tool_result" did not appear anywhere
+    // in the shipped bundle. Consequence: a downstream that failed CLEANLY
+    // (correct exit code, correct isError on the MCP response) was recorded
+    // byte-identically to one that did the work, so every log-derived health
+    // check scored a fully-dead capability as healthy. Found 2026-09-05 after
+    // Muriel's Gmail OAuth token died on 08-26 and ran 10 days / ~275 runs /
+    // $255 without a single instrument noticing.
+    //
+    // Deliberately NOT folded into `hasError`. That field means "this run did
+    // not complete" and the abort accounting in agent-roundup.py depends on
+    // that meaning. A run that calls a dead API, gets a clean error, and
+    // correctly reports the outage DID complete — Muriel's did, all 275 of
+    // them, and flagging them as failed runs would be false in the opposite
+    // direction. Run health and capability health are different questions;
+    // they get different fields.
+    const toolErrors: { tool: string; excerpt: string }[] = [];
+    const toolUseNames = new Map<string, string>();
 
     // KPR-324 C2/S2: tool-start acknowledgment state (spec §4.1 segment
     // rule). Per-turn locals — rotation is caller-owned so concurrent calls
@@ -2409,7 +2431,11 @@ export class AgentRunner {
                 }
                 activeToolName = block.name;
                 const activeToolStart = Date.now();
-                toolCalls.push({ tool: block.name, startMs: activeToolStart });
+                toolCalls.push({ tool: block.name, startMs: activeToolStart, id: block.id });
+                // KPR-434: retain id -> name so the tool_result branch below
+                // can name the tool that failed. Results arrive in a separate
+                // message and carry only tool_use_id.
+                if (block.id) toolUseNames.set(block.id, block.name);
                 log.info("Tool call started", {
                   agent: this.agentConfig.id,
                   tool: block.name,
@@ -2419,6 +2445,45 @@ export class AgentRunner {
           }
           if (msg.session_id) {
             resultSessionId = msg.session_id;
+          }
+        }
+
+        // KPR-434: the branch that did not exist. Tool results come back as
+        // `user`-type messages whose content array holds tool_result blocks;
+        // a failed tool sets is_error. Read-only — this records the outcome
+        // and never alters control flow, so a run that was going to succeed
+        // still succeeds and the agent still decides how to handle its own
+        // tool failures (it already sees them in its context).
+        if (msg.type === "user") {
+          const content = (msg as any).message?.content;
+          if (Array.isArray(content)) {
+            for (const block of content) {
+              if (block?.type !== "tool_result" || block.is_error !== true) continue;
+              const tool = toolUseNames.get(block.tool_use_id) ?? "unknown";
+              // block.content is string | Array<{type:"text",text}> per the
+              // MCP content shape — normalize both, then bound the length so
+              // a tool that fails by returning a megabyte cannot bloat the
+              // log line or the completion record.
+              const raw =
+                typeof block.content === "string"
+                  ? block.content
+                  : Array.isArray(block.content)
+                    ? block.content
+                        .map((c: any) => (typeof c?.text === "string" ? c.text : ""))
+                        .join(" ")
+                    : "";
+              const excerpt = raw.replace(/\s+/g, " ").trim().slice(0, 300);
+              toolErrors.push({ tool, excerpt });
+              // warn, not error: `error` level reaches hive.err, which is for
+              // faults in the harness itself. A downstream returning a clean
+              // failure is not a harness fault — but it must be greppable, and
+              // until now it was not present in the log at ANY level.
+              log.warn("Tool call failed", {
+                agent: this.agentConfig.id,
+                tool,
+                error: excerpt,
+              });
+            }
           }
         }
 
@@ -2529,6 +2594,19 @@ export class AgentRunner {
       .map(([name, s]) => `${name}:${s.count}x/${(s.totalMs / 1000).toFixed(1)}s`)
       .join(", ");
 
+    // KPR-434: "google:3x" in toolSummary says three calls were made, not that
+    // any returned data. This is the companion count, plus a per-tool tally so
+    // a roll-up can name the broken capability without reparsing the log.
+    const toolErrorStats: Record<string, number> = {};
+    for (const te of toolErrors) {
+      const serverName = te.tool.includes("__") ? te.tool.split("__")[1]! : te.tool;
+      toolErrorStats[serverName] = (toolErrorStats[serverName] ?? 0) + 1;
+    }
+    const toolErrorSummary = Object.entries(toolErrorStats)
+      .sort((a, b) => b[1] - a[1])
+      .map(([name, n]) => `${name}:${n}`)
+      .join(", ");
+
     const totalToolMs = toolCalls.reduce((sum, tc) => sum + ((tc.endMs ?? Date.now()) - tc.startMs), 0);
     // KPR-401 (c): result-less exits (deadline abort, operator abort, mid-
     // iteration throw) never assigned durationMs — real wall clock instead
@@ -2561,6 +2639,12 @@ export class AgentRunner {
       toolMs: totalToolMs,
       toolCalls: toolCalls.length,
       toolSummary: toolSummary || "none",
+      // KPR-434: capability health, distinct from run health (`hasError`).
+      // Always emitted — a health check must be able to distinguish "0 tool
+      // failures" from "this build doesn't report tool failures", which is
+      // exactly the ambiguity that hid the Gmail outage for 10 days.
+      toolErrors: toolErrors.length,
+      ...(toolErrorSummary ? { toolErrorSummary } : {}),
       inputTokens,
       outputTokens,
       cacheReadTokens,
