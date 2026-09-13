@@ -2605,7 +2605,7 @@ Meeting rules:
             ? ":iphone:"
             : ":incoming_envelope:";
     const senderDisplay = result.workItem.senderName ?? result.workItem.sender;
-    const summary = result.text.length > 300 ? result.text.slice(0, 300) + "..." : result.text;
+    const summary = buildAuditSummary(result.text);
 
     const auditItem: WorkItem = {
       id: `audit:${result.workItem.id}`,
@@ -2628,4 +2628,38 @@ Meeting rules:
       durationMs: 0,
     });
   }
+}
+
+/** Body budget for an audit-log summary, in characters. */
+export const AUDIT_SUMMARY_CHARS = 300;
+
+/**
+ * Build the blockquoted body of an audit-log post.
+ *
+ * The audit log is a *summary* channel, not a delivery channel — the agent's
+ * full reply has already gone to its real destination by the time we get here.
+ * The cap is therefore intentional and stays.
+ *
+ * What is NOT intentional is losing text silently. The previous implementation
+ * emitted a bare `"..."`, which is visually indistinguishable from an author's
+ * own ellipsis. Readers treated truncated audit posts as complete replies and
+ * acted on partial information — three times between 2026-08-23 and 2026-09-13,
+ * twice producing a materially wrong status board.
+ *
+ * So: cut on a whitespace boundary (never mid-word, never mid-`code span`), and
+ * state the loss explicitly with the omitted character count plus where the full
+ * text lives. A reader who sees this marker knows to go look elsewhere.
+ */
+export function buildAuditSummary(text: string, limit: number = AUDIT_SUMMARY_CHARS): string {
+  if (text.length <= limit) return text;
+
+  // Prefer the last whitespace in the budget so we never sever a word or an
+  // inline code span. Fall back to a hard cut for text with no whitespace at all
+  // (minified payloads, long URLs) — those have no safe boundary to find.
+  const head = text.slice(0, limit);
+  const lastSpace = head.search(/\s\S*$/);
+  const body = (lastSpace > limit * 0.5 ? head.slice(0, lastSpace) : head).trimEnd();
+
+  const omitted = text.length - body.length;
+  return `${body} […]\n_[audit summary truncated — ${omitted.toLocaleString()} more characters in the full reply, which was delivered in full to its original destination. Recover via conversation_search.]_`;
 }
