@@ -6,8 +6,12 @@
  *
  * Operations (idempotent, safe to re-run):
  *   1. Add "ollama" to Julie's `coreServers` if absent.
- *   2. Append the Personnel Data privacy boundary to Julie's `soul` if absent
- *      (detected by the GUARDRAIL_MARKER heading).
+ *   2. Insert the model-routing privacy boundary into Julie's `systemPrompt` if
+ *      absent (detected by the GUARDRAIL_HEADING constant).
+ *
+ * Field and heading are per Tony's 2026-09-18 ruling: Julie first, systemPrompt
+ * (not soul), fixed section heading. See GUARDRAIL_HEADING for why the heading
+ * is a shared constant rather than a per-agent phrasing.
  *
  * Usage:
  *   npx tsx scripts/migrate-julie-ollama.ts --instance catalyst            # dry-run
@@ -24,13 +28,42 @@
  * other seven agents their Ollama access for weeks. Config after code, always.
  */
 
+import { realpathSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
 import { MongoClient } from "mongodb";
 
 const AGENT_NAME = "Julie";
 const SERVER = "ollama";
 
-/** Idempotency marker — if Julie's soul contains this, the guardrail is in. */
-const GUARDRAIL_MARKER = "## Personnel Data — Privacy Boundary";
+/**
+ * Fixed section heading — IDENTICAL for every agent that gets this rule.
+ *
+ * This is deliberately NOT domain-specific ("Personnel Data", "Client Records",
+ * ...). The parity rollout has to add this rule to six more agents, and nothing
+ * in the system currently audits systemPrompt/soul drift — `check:core-servers`
+ * covers coreServers only. One constant heading means presence is detectable by
+ * a single exact-match string across all agents: one idempotency check, one
+ * rollback path, and a future guardrail audit is a one-liner instead of a
+ * per-agent marker table. Domain specificity lives in the body, where it costs
+ * nothing.
+ *
+ * Distinct from Ross's existing "## Document Handling — Privacy Boundary": that
+ * rule routes DOCUMENTS, this one routes INFERENCE. Ross's is left untouched;
+ * he will get this section in addition, not instead.
+ *
+ * If this string is ever changed, every already-migrated agent needs a rewrite
+ * migration — treat it as a schema constant, not a wording preference.
+ */
+export const GUARDRAIL_HEADING = "## Model Routing — Privacy Boundary";
+
+/**
+ * Deterministic placement anchor. The section is inserted immediately BEFORE
+ * this heading when present, otherwise appended. Julie, Ross and the rest all
+ * carry a "## Guardrails" section, so this puts the rule in the same region of
+ * every agent's prompt rather than wherever the file happened to end.
+ */
+export const PLACEMENT_ANCHOR = "## Guardrails";
 
 /**
  * Mirrors the shape of Ross's "Document Handling — Privacy Boundary": two named
@@ -53,8 +86,8 @@ const GUARDRAIL_MARKER = "## Personnel Data — Privacy Boundary";
  * to a weaker model by guess is silent quality degradation where it does the
  * most damage.
  */
-const GUARDRAIL = `
-${GUARDRAIL_MARKER}
+export const GUARDRAIL = `
+${GUARDRAIL_HEADING}
 
 **Local model (privacy-preserving) — use for anything about a named person.**
 Use this for: performance reviews, compensation figures, disciplinary records, health or
@@ -79,6 +112,28 @@ locally. Never route identifiable personnel material to a cloud model because th
 be better. If local capability is genuinely insufficient for a personnel question, say so and
 ask Mike — do not silently upgrade.
 `;
+
+/** Insert the guardrail before PLACEMENT_ANCHOR, or append if the anchor is absent. */
+export function insertGuardrail(prompt: string): string {
+  const body = prompt.trimEnd();
+  const at = body.indexOf(`\n${PLACEMENT_ANCHOR}`);
+  if (at === -1) return `${body}\n${GUARDRAIL}`;
+  return `${body.slice(0, at)}\n${GUARDRAIL}\n${body.slice(at + 1)}`;
+}
+
+/**
+ * Remove the guardrail section: from its heading up to the next H2, or to the
+ * end. Structural rather than exact-string removal so that a later whitespace
+ * or wording edit to GUARDRAIL cannot strand an un-rollback-able section.
+ */
+export function removeGuardrail(prompt: string): string {
+  const at = prompt.indexOf(GUARDRAIL_HEADING);
+  if (at === -1) return prompt;
+  const rest = prompt.slice(at + GUARDRAIL_HEADING.length);
+  const next = rest.search(/\n## /);
+  const tail = next === -1 ? "" : rest.slice(next + 1);
+  return `${prompt.slice(0, at).trimEnd()}\n\n${tail}`.trimEnd();
+}
 
 function arg(flag: string): string | undefined {
   const i = process.argv.indexOf(flag);
@@ -108,36 +163,56 @@ async function main(): Promise<void> {
     }
 
     const core: string[] = Array.isArray(julie.coreServers) ? julie.coreServers : [];
+    const prompt: string = typeof julie.systemPrompt === "string" ? julie.systemPrompt : "";
     const soul: string = typeof julie.soul === "string" ? julie.soul : "";
     const hasServer = core.includes(SERVER);
-    const hasGuardrail = soul.includes(GUARDRAIL_MARKER);
+    const hasGuardrail = prompt.includes(GUARDRAIL_HEADING);
+    // An earlier revision of this script targeted `soul`. If a stray copy ever
+    // landed it there, say so loudly rather than silently writing a second one.
+    const strayInSoul = soul.includes(GUARDRAIL_HEADING) || soul.includes("Privacy Boundary");
 
     console.log(`Target: ${dbName}.agent_definitions / ${AGENT_NAME}`);
-    console.log(`  coreServers now : ${JSON.stringify(core)}`);
-    console.log(`  has "${SERVER}"      : ${hasServer}`);
-    console.log(`  has guardrail   : ${hasGuardrail}`);
-    console.log(`  soul length     : ${soul.length}`);
+    console.log(`  coreServers now   : ${JSON.stringify(core)}`);
+    console.log(`  has "${SERVER}"        : ${hasServer}`);
+    console.log(`  has guardrail     : ${hasGuardrail} (field: systemPrompt)`);
+    console.log(`  systemPrompt len  : ${prompt.length}`);
+    console.log(`  anchor present    : ${prompt.includes(PLACEMENT_ANCHOR)} ("${PLACEMENT_ANCHOR}")`);
+    if (strayInSoul) {
+      console.error(`\n  !! A privacy-boundary section also appears in .soul — resolve by hand.`);
+      console.error(`     systemPrompt is the field of record; two copies is a drift bug.`);
+      process.exit(1);
+    }
 
     const set: Record<string, unknown> = {};
 
     if (rollback) {
       if (hasServer) set.coreServers = core.filter((s) => s !== SERVER);
-      if (hasGuardrail) set.soul = soul.replace(GUARDRAIL, "").trimEnd();
+      if (hasGuardrail) set.systemPrompt = removeGuardrail(prompt);
       if (Object.keys(set).length === 0) {
         console.log("\nNothing to roll back — already clean.");
         return;
       }
       console.log(`\nROLLBACK plan: remove "${SERVER}" from coreServers and strip the guardrail.`);
+      if (set.systemPrompt) {
+        console.log(`  systemPrompt -> ${prompt.length} chars becomes ${(set.systemPrompt as string).length}`);
+      }
     } else {
       if (!hasServer) set.coreServers = [...core, SERVER];
-      if (!hasGuardrail) set.soul = `${soul.trimEnd()}\n${GUARDRAIL}`;
+      if (!hasGuardrail) set.systemPrompt = insertGuardrail(prompt);
       if (Object.keys(set).length === 0) {
         console.log("\nNo change needed — migration already applied.");
         return;
       }
       console.log(`\nPlan:`);
-      if (set.coreServers) console.log(`  coreServers -> ${JSON.stringify(set.coreServers)}`);
-      if (set.soul) console.log(`  soul        -> append ${GUARDRAIL.length} chars (privacy boundary)`);
+      if (set.coreServers) console.log(`  coreServers  -> ${JSON.stringify(set.coreServers)}`);
+      if (set.systemPrompt) {
+        const next = set.systemPrompt as string;
+        const where = prompt.includes(PLACEMENT_ANCHOR) ? `before "${PLACEMENT_ANCHOR}"` : "appended at end";
+        console.log(`  systemPrompt -> insert ${GUARDRAIL.length} chars ${where}`);
+        console.log(`                  ${prompt.length} chars becomes ${next.length}`);
+        console.log(`\n  --- section headings after migration ---`);
+        for (const h of next.match(/^#{1,4} .*$/gm) ?? []) console.log(`    ${h}`);
+      }
     }
 
     if (!apply) {
@@ -155,7 +230,26 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+/**
+ * tsx-compatible main detection, same idiom as scripts/flatten-skills.ts —
+ * `pathToFileURL` (argv[1] may need percent-encoding) with a realpath fallback
+ * for symlinked invocation. Needed here so the exported pure helpers can be
+ * unit-tested without the import opening a Mongo connection.
+ */
+function isMain(): boolean {
+  const entry = process.argv[1];
+  if (entry === undefined) return false;
+  if (import.meta.url === pathToFileURL(entry).href) return true;
+  try {
+    return fileURLToPath(import.meta.url) === realpathSync(entry);
+  } catch {
+    return false;
+  }
+}
+
+if (isMain()) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
