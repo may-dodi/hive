@@ -113,12 +113,30 @@ be better. If local capability is genuinely insufficient for a personnel questio
 ask Mike — do not silently upgrade.
 `;
 
-/** Insert the guardrail before PLACEMENT_ANCHOR, or append if the anchor is absent. */
-export function insertGuardrail(prompt: string): string {
+/**
+ * Insert the guardrail before PLACEMENT_ANCHOR, or append if the anchor is absent.
+ *
+ * `section` defaults to Julie's body, so the existing call site and every existing
+ * test are unchanged. Guardrail parity needs six more agents carrying DOMAIN-SPECIFIC
+ * bodies under the SAME heading — the heading is the schema constant, the body is not.
+ * Passing the body in (rather than forking a near-copy of this function into the
+ * rollout script) keeps one placement rule and one rollback path, which is the whole
+ * reason GUARDRAIL_HEADING is a shared constant in the first place.
+ *
+ * Throws if `section` does not carry GUARDRAIL_HEADING: a section written under any
+ * other heading is invisible to removeGuardrail and therefore cannot be rolled back.
+ */
+export function insertGuardrail(prompt: string, section: string = GUARDRAIL): string {
+  if (!section.includes(GUARDRAIL_HEADING)) {
+    throw new Error(
+      `guardrail section must contain ${JSON.stringify(GUARDRAIL_HEADING)} — ` +
+        `a section under any other heading cannot be rolled back`,
+    );
+  }
   const body = prompt.trimEnd();
   const at = body.indexOf(`\n${PLACEMENT_ANCHOR}`);
-  if (at === -1) return `${body}\n${GUARDRAIL}`;
-  return `${body.slice(0, at)}\n${GUARDRAIL}\n${body.slice(at + 1)}`;
+  if (at === -1) return `${body}\n${section}`;
+  return `${body.slice(0, at)}\n${section}\n${body.slice(at + 1)}`;
 }
 
 /**

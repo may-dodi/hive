@@ -97,3 +97,38 @@ describe("idempotency contract", () => {
     expect(out).toContain(GUARDRAIL_HEADING);
   });
 });
+
+/**
+ * Guardrail parity (Bill, Diana, Lily, Nora, Stefan, Warren, + Ross additively)
+ * reuses these helpers with a per-agent body under the SAME heading. These tests
+ * pin the contract the rollout script depends on.
+ */
+describe("per-agent guardrail bodies", () => {
+  const DIANA = `\n${GUARDRAIL_HEADING}\n\nRun locally for anything naming a real client or their figures.\n`;
+
+  it("writes the supplied body, not Julie's, and places it identically", () => {
+    const out = insertGuardrail(PROMPT, DIANA);
+    expect(out).toContain("naming a real client");
+    expect(out).not.toContain("performance reviews");
+    // Same deterministic placement rule as the default body.
+    expect(out.indexOf(GUARDRAIL_HEADING)).toBeLessThan(out.indexOf(PLACEMENT_ANCHOR));
+  });
+
+  it("rolls back a per-agent body with the unchanged, body-independent remover", () => {
+    expect(removeGuardrail(insertGuardrail(PROMPT, DIANA))).toBe(PROMPT.trimEnd());
+  });
+
+  it("stays idempotent per agent: one heading, one section", () => {
+    expect(insertGuardrail(PROMPT, DIANA).split(GUARDRAIL_HEADING).length - 1).toBe(1);
+  });
+
+  it("rejects a body under a different heading rather than writing an unremovable section", () => {
+    // Without this guard the section lands but removeGuardrail cannot find it,
+    // stranding text in a live agent prompt with no rollback path.
+    expect(() => insertGuardrail(PROMPT, "\n## Model Routing\n\nbody\n")).toThrow(/cannot be rolled back/);
+  });
+
+  it("defaults to Julie's body when no body is passed (existing call site unchanged)", () => {
+    expect(insertGuardrail(PROMPT)).toBe(insertGuardrail(PROMPT, GUARDRAIL));
+  });
+});
