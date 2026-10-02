@@ -65,6 +65,21 @@ export const LLM_CATALOG: readonly CatalogModel[] = [
     capabilities: ["json", "structured-outputs", "vision", "effort"],
   },
   {
+    // Opus 5.5 (2026-09-21). Same capability surface as opus-5; effort accepted
+    // (low|medium|high|xhigh|max), thinking adaptive-only (no explicit enable).
+    // modelToTier already resolves it via the "opus" substring family (KPR-433).
+    id: "claude-opus-5-5",
+    provider: "anthropic",
+    capabilities: ["json", "structured-outputs", "vision", "effort"],
+  },
+  {
+    // Sonnet 5.5 (2026-09-28). Effort accepted including xhigh (Sonnet 5 line).
+    // modelToTier resolves it via the "sonnet" substring family (KPR-433).
+    id: "claude-sonnet-5-5",
+    provider: "anthropic",
+    capabilities: ["json", "structured-outputs", "vision", "effort"],
+  },
+  {
     // Default vision-task model (config.gemini.visionModel default).
     id: "gemini-2.5-flash",
     provider: "gemini",

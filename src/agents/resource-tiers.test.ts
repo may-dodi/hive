@@ -76,6 +76,8 @@ describe("modelToTier (KPR-433 D1)", () => {
     ["claude-fable-5-1", "opus"],
     ["claude-fable-5", "opus"],
     ["claude-mythos-5-1", "opus"],
+    ["claude-opus-5-5", "opus"],
+    ["claude-sonnet-5-5", "sonnet"],
     ["claude-opus-fable-x", "opus"], // §7.1 precedence — opus either way
   ] as Array<[string, ModelTier]>)("%s → %s without warning", (model, tier) => {
     expect(modelToTier(model)).toBe(tier);
